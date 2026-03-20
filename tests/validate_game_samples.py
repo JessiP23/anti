@@ -23,7 +23,14 @@ async def run(
     max_clean_flag_rate: float,
 ) -> None:
     path = Path(sample_file)
-    lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    lines: list[str] = []
+    if path.is_dir():
+        for file in sorted(path.rglob("*.jsonl")):
+            lines.extend(
+                [line for line in file.read_text(encoding="utf-8").splitlines() if line.strip()]
+            )
+    else:
+        lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     counts: Counter[str] = Counter()
     flagged: Counter[str] = Counter()
     failures = 0

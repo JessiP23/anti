@@ -45,8 +45,13 @@ services:
       GATEWAY_DETECTOR_URL: http://detector:8001
       GATEWAY_DECISION_URL: http://decision:8003
       GATEWAY_ACTION_URL: http://action:8004
+      GATEWAY_SAMPLER_DIR: /app/data/live_samples
+      GATEWAY_SAMPLER_FLUSH_INTERVAL_SECONDS: 3
+      GATEWAY_SAMPLER_MAX_RECORDS_PER_FILE: 500
     ports:
       - "8000:8000"
+    volumes:
+      - ./data/live_samples:/app/data/live_samples
     depends_on:
       - detector
       - decision
