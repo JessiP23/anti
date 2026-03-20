@@ -162,7 +162,7 @@ async def ingest_summary(summary: SessionSummary) -> dict[str, str]:
 
 
 @app.post("/v1/event")
-async def ingest_event(event: PlayerEvent) -> dict[str, str | float]:
+async def ingest_event(event: PlayerEvent) -> dict[str, Any]:
     if _checksum(event) != event.client_checksum:
         raise HTTPException(status_code=400, detail="checksum_mismatch")
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -194,6 +194,8 @@ async def ingest_event(event: PlayerEvent) -> dict[str, str | float]:
     return {
         "status": "ok",
         "detector_score": detector_data["score"],
+        "signals": detector_data["signals"],
+        "detector_model_version": detector_data["model_version"],
         "decision_score": decision_data["score"],
         "decision": decision_data["decision"],
     }
