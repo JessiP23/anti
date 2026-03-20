@@ -2,7 +2,7 @@ import hashlib
 import json
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -118,3 +118,107 @@ class AntiCheatSession:
             response.raise_for_status()
             data = response.json()
         return {"status": "sent", "risk": risk, "response": data}
+
+
+@dataclass
+class LiveSamplerSender:
+    game_id: str
+    server_id: str
+    gateway_url: str
+    player_id: str
+    session_id: str
+    sdk_version: str = "0.1.0"
+    batch_size: int = 25
+    flush_interval_seconds: int = 3
+    timeout_seconds: float = 10.0
+    http_client: httpx.AsyncClient | None = None
+    _buffer: list[dict[str, Any]] = field(default_factory=list)
+    _last_flush_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+    _owned_client: httpx.AsyncClient | None = field(default=None, init=False, repr=False)
+
+    def _batch_url(self) -> str:
+        return f"{self.gateway_url}/v1/live-sampler/{self.game_id}/{self.server_id}/batch"
+
+    def _flush_url(self) -> str:
+        return f"{self.gateway_url}/v1/live-sampler/{self.game_id}/{self.server_id}/flush"
+
+    def _status_url(self) -> str:
+        return f"{self.gateway_url}/v1/live-sampler/{self.game_id}/{self.server_id}/status"
+
+    def _build_raw_event(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        label: str,
+        timestamp_ms: int | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "player_id": self.player_id,
+            "session_id": self.session_id,
+            "event_type": event_type,
+            "payload": payload,
+            "label": label,
+            "sdk_version": self.sdk_version,
+            "timestamp_ms": timestamp_ms or int(time.time() * 1000),
+        }
+
+    def _should_flush(self) -> bool:
+        if len(self._buffer) >= self.batch_size:
+            return True
+        elapsed_ms = int(time.time() * 1000) - self._last_flush_ms
+        return elapsed_ms >= self.flush_interval_seconds * 1000
+
+    def _client(self) -> httpx.AsyncClient:
+        if self.http_client:
+            return self.http_client
+        if self._owned_client is None:
+            self._owned_client = httpx.AsyncClient(timeout=self.timeout_seconds)
+        return self._owned_client
+
+    async def enqueue_event(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        label: str = "unknown",
+        timestamp_ms: int | None = None,
+    ) -> dict[str, int]:
+        self._buffer.append(
+            self._build_raw_event(
+                event_type=event_type,
+                payload=payload,
+                label=label,
+                timestamp_ms=timestamp_ms,
+            )
+        )
+        flushed = 0
+        if self._should_flush():
+            flushed = await self.flush()
+        return {"buffered": len(self._buffer), "flushed": flushed}
+
+    async def flush(self) -> int:
+        if not self._buffer:
+            return 0
+        payload = {"events": self._buffer}
+        response = await self._client().post(self._batch_url(), json=payload)
+        response.raise_for_status()
+        flushed = len(self._buffer)
+        self._buffer = []
+        self._last_flush_ms = int(time.time() * 1000)
+        return flushed
+
+    async def force_flush_remote(self) -> dict[str, Any]:
+        response = await self._client().post(self._flush_url())
+        response.raise_for_status()
+        return response.json()
+
+    async def status(self) -> dict[str, Any]:
+        response = await self._client().get(self._status_url())
+        response.raise_for_status()
+        return response.json()
+
+    async def close(self) -> None:
+        if self._buffer:
+            await self.flush()
+        if self._owned_client:
+            await self._owned_client.aclose()
+            self._owned_client = None
