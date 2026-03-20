@@ -1,0 +1,13 @@
+[project]
+name = "anticheat-sdk"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "httpx>=0.28.1",
+  "numpy>=2.2.4",
+  "pydantic>=2.11.2",
+]
+
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"

@@ -1,0 +1,33 @@
+[project]
+name = "anticheat-ai"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv.workspace]
+members = [
+  "services/gateway",
+  "services/detector",
+  "services/ml_worker",
+  "services/decision",
+  "services/action",
+  "sdk/python",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3.5",
+  "pytest-asyncio>=0.26.0",
+  "httpx>=0.28.1",
+  "ruff>=0.11.4",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

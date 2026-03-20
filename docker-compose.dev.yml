@@ -1,0 +1,85 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  redpanda:
+    image: redpandadata/redpanda:v24.1.1
+    command:
+      - redpanda
+      - start
+      - --smp
+      - "1"
+      - --memory
+      - "512M"
+      - --reserve-memory
+      - "0M"
+      - --overprovisioned
+      - --node-id
+      - "0"
+      - --check=false
+      - --kafka-addr
+      - PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      - --advertise-kafka-addr
+      - PLAINTEXT://redpanda:29092,OUTSIDE://localhost:9092
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_DB: anticheat
+      POSTGRES_USER: anticheat
+      POSTGRES_PASSWORD: anticheat
+    ports:
+      - "5432:5432"
+
+  gateway:
+    build:
+      context: .
+      dockerfile: services/Dockerfile
+    command: uv run uvicorn services.gateway.main:app --host 0.0.0.0 --port 8000
+    environment:
+      GATEWAY_DETECTOR_URL: http://detector:8001
+      GATEWAY_DECISION_URL: http://decision:8003
+      GATEWAY_ACTION_URL: http://action:8004
+    ports:
+      - "8000:8000"
+    depends_on:
+      - detector
+      - decision
+      - action
+
+  detector:
+    build:
+      context: .
+      dockerfile: services/Dockerfile
+    command: uv run uvicorn services.detector.main:app --host 0.0.0.0 --port 8001
+    ports:
+      - "8001:8001"
+
+  ml_worker:
+    build:
+      context: .
+      dockerfile: services/Dockerfile
+    command: uv run uvicorn services.ml_worker.main:app --host 0.0.0.0 --port 8002
+    ports:
+      - "8002:8002"
+
+  decision:
+    build:
+      context: .
+      dockerfile: services/Dockerfile
+    command: uv run uvicorn services.decision.main:app --host 0.0.0.0 --port 8003
+    ports:
+      - "8003:8003"
+
+  action:
+    build:
+      context: .
+      dockerfile: services/Dockerfile
+    command: uv run uvicorn services.action.main:app --host 0.0.0.0 --port 8004
+    ports:
+      - "8004:8004"

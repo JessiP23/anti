@@ -1,0 +1,1194 @@
+# Anti-Cheat AI System — Agent Build Prompt v2
+# Architecture: Smart Sampling + Client-Side Pre-Filter
+# Cost target: ~$40/mo per 1M MAU · Studio subscription model
+
+---
+
+## 0. AGENT PRIME DIRECTIVE
+
+You are a senior ML/backend engineer building a production-grade, game-agnostic AI
+anti-cheat system. Every decision you make must optimize for three constraints in order:
+
+  1. CORRECTNESS  — detections must be accurate (FPR < 0.5% at auto-ban threshold)
+  2. COST         — infra must stay near-flat regardless of user scale
+  3. SPEED        — critical path latency < 50ms; demo must run in one command
+
+Never sacrifice constraint 1 for 2 or 3. Never add a managed cloud service when a
+self-hosted equivalent exists and performs the same. Always write tests before shipping.
+
+---
+
+## 1. REPOSITORY LAYOUT
+
+```
+anticheat-ai/
+├── sdk/
+│   ├── python/          # pip-installable game-server SDK
+│   ├── unity/           # Unity C# plugin (wraps HTTP SDK)
+│   └── unreal/          # Unreal Engine 5 C++ plugin
+├── services/
+│   ├── gateway/         # FastAPI · WebSocket ingest · rate limiting
+│   ├── detector/        # Real-time rule engine · <50ms SLA
+│   ├── ml_worker/       # Async XGBoost + LSTM inference consumer
+│   ├── decision/        # Ensemble scoring · threshold routing
+│   └── action/          # Ban / flag / shadow-ban webhook executor
+├── models/
+│   ├── features/        # SINGLE SOURCE OF TRUTH for all feature defs
+│   ├── training/        # Jupyter notebooks + training scripts
+│   └── registry/        # MLflow config · model versioning
+├── infra/
+│   ├── docker/          # docker-compose.dev.yml · Dockerfiles
+│   ├── hetzner/         # Ansible playbooks for Hetzner VPS provisioning
+│   └── nginx/           # nginx.conf · TLS termination · load balancing
+├── dashboard/
+│   ├── admin/           # Next.js 14 · human review UI
+│   └── grafana/         # Dashboard JSON exports
+├── tests/
+│   ├── unit/
+│   ├── integration/
+│   └── e2e/
+├── pyproject.toml       # workspace root (uv workspaces)
+├── uv.lock
+└── docker-compose.dev.yml
+```
+
+### Monorepo tooling
+- **uv** for all Python dependency management (NOT pip, NOT poetry)
+- **turbo** for task orchestration across packages
+- **ruff** for linting + formatting (replaces black + isort + flake8)
+- **pytest** with pytest-asyncio for all tests
+- **GitHub Actions** for CI — test → lint → build → push on every PR
+
+---
+
+## 2. TECH STACK — LOCKED DECISIONS
+
+### Python services
+| Concern | Choice | Reason |
+|---|---|---|
+| Runtime | Python 3.12 | latest stable, uv native |
+| Web framework | FastAPI 0.115+ | async-native, Pydantic v2 built-in |
+| Data validation | Pydantic v2 | 5-10x faster than v1 |
+| Async DB driver | asyncpg 0.30+ | fastest Postgres driver |
+| ORM | SQLAlchemy 2.0 async | works with asyncpg |
+| Queue consumer | aiokafka 0.11+ | async Kafka consumer |
+| ML — tabular | XGBoost 2.1+ | best accuracy/cost on behavioral data |
+| ML — anomaly | scikit-learn 1.5+ Isolation Forest | unsupervised, no labels needed |
+| ML — temporal | PyTorch 2.3+ LSTM | session-level sequence modeling |
+| Feature store cache | redis-py 5.0+ async | sub-ms feature lookups |
+| Model registry | MLflow 2.14+ | self-hosted on Hetzner + S3-compatible |
+| Observability | opentelemetry-sdk | traces + metrics, Grafana backend |
+
+### Infrastructure (self-hosted, NOT managed cloud)
+| Component | Choice | Monthly cost |
+|---|---|---|
+| Compute | Hetzner CX22 (2 vCPU / 4GB) | €4/mo each |
+| Message bus | Redpanda (self-hosted, single node for <10M MAU) | €0 (runs on same VPS) |
+| Database | TimescaleDB (PostgreSQL extension) | €0 (runs on dedicated CX22) |
+| Cache | Redis 7 (self-hosted) | €0 (runs on gateway VPS) |
+| Object storage | Hetzner Object Storage (S3-compatible) | €0.026/GB |
+| TLS + LB | Nginx + Let's Encrypt | €0 |
+| Model registry | MLflow self-hosted | €0 |
+| Monitoring | Grafana + Prometheus | €0 |
+
+### VPS allocation for 1M MAU
+```
+vps-01  CX22  €4/mo   gateway + redis + nginx
+vps-02  CX22  €4/mo   detector + ml_worker + decision
+vps-03  CX42  €14/mo  timescaledb + redpanda
+vps-04  CX22  €4/mo   mlflow + grafana + prometheus
+                      ─────────────────────────────
+Total                 €26/mo ≈ $28/mo
+```
+
+Scale horizontally by adding CX22 nodes behind nginx — no code changes needed.
+
+### Frontend
+- **Next.js 14** (App Router) for admin dashboard
+- **Tailwind CSS** for styling
+- **shadcn/ui** for components
+- **Recharts** for analytics charts
+- Deployed on vps-04 as a static export served by Nginx
+
+---
+
+## 3. THE CORE INNOVATION — CLIENT-SIDE SMART SAMPLING
+
+This is what makes the cost model work. Read this section before writing any code.
+
+### Problem with naive approach
+Sending all game events to the server for 1M users at 1,000 events/user/day =
+1 billion events/day. Processing this costs ~$12,000/mo minimum. Unacceptable.
+
+### Solution: 3-tier event filtering
+
+```
+TIER 1 — Client-side SDK (runs in-process, zero server cost)
+  Every user: compute rolling RiskScore on last 30 seconds of behavior
+  RiskScore < 0.3  →  drop event, accumulate into session summary only
+  RiskScore ≥ 0.3  →  enter TIER 2
+
+TIER 2 — Anomaly burst (triggered by SDK, real-time server path)
+  Stream full events for this session window to gateway
+  Server runs Isolation Forest + rule engine → fast verdict
+  Verdict < 0.7  →  back to TIER 1 monitoring
+  Verdict ≥ 0.7  →  enter TIER 3
+
+TIER 3 — Deep ML analysis
+  XGBoost + LSTM on full session history
+  Produces final ensemble score → decision engine
+```
+
+### Session summary batching (the traffic killer)
+Clean players (TIER 1 only) send ONE compressed summary per 5-minute session window:
+- 32 pre-computed feature floats (aim stats, movement stats, timing stats)
+- gzip compressed → ~200 bytes per batch
+- Sent via HTTP POST (not WebSocket) to reduce connection overhead
+
+At 1M users, 95% clean, 288 batches/day each:
+- Clean traffic: 950,000 × 288 × 200 bytes = **54 GB/day** (vs 1TB+ for full events)
+- Suspicious traffic: 50,000 × full events = **~5 GB/day**
+- **Total: ~59 GB/day** — Hetzner charges €1/TB. This costs **€1.77/mo** in bandwidth.
+
+### SDK local RiskScore computation
+```python
+# sdk/python/anticheat_sdk/local_scorer.py
+import math
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Deque
+
+@dataclass
+class LocalScorer:
+    """
+    Runs entirely in-process on game client/server.
+    No network calls. No dependencies beyond stdlib + numpy.
+    """
+    window_seconds: int = 30
+    _shot_intervals: Deque[float] = field(default_factory=lambda: deque(maxlen=100))
+    _aim_deltas: Deque[tuple] = field(default_factory=lambda: deque(maxlen=200))
+    _move_speeds: Deque[float] = field(default_factory=lambda: deque(maxlen=100))
+    _last_shot_ts: float = 0.0
+
+    def on_shot_fired(self, timestamp_ms: float, aim_vector: tuple) -> None:
+        if self._last_shot_ts > 0:
+            interval = timestamp_ms - self._last_shot_ts
+            self._shot_intervals.append(interval)
+        self._last_shot_ts = timestamp_ms
+
+    def on_mouse_move(self, dx: float, dy: float) -> None:
+        self._aim_deltas.append((dx, dy))
+
+    def on_move(self, speed: float) -> None:
+        self._move_speeds.append(speed)
+
+    def compute_risk_score(self) -> float:
+        """Returns 0.0 (clean) to 1.0 (highly suspicious). No network."""
+        scores = []
+
+        # Trigger bot signal: inhuman consistency in shot timing
+        if len(self._shot_intervals) >= 10:
+            mean = sum(self._shot_intervals) / len(self._shot_intervals)
+            if mean > 0:
+                cv = (
+                    math.sqrt(sum((x - mean)**2 for x in self._shot_intervals)
+                    / len(self._shot_intervals)) / mean
+                )
+                # Human CV ~0.15-0.4, trigger bot CV < 0.02
+                scores.append(max(0.0, 1.0 - (cv / 0.05)))
+
+        # Aimbot signal: impossible angular velocity
+        if len(self._aim_deltas) >= 20:
+            magnitudes = [math.sqrt(dx**2 + dy**2) for dx, dy in self._aim_deltas]
+            max_snap = max(magnitudes)
+            # >3000 deg/sec equivalent is physically impossible for humans
+            if max_snap > 3000:
+                scores.append(min(1.0, max_snap / 5000))
+
+        # Speed hack signal: movement speed anomaly
+        if len(self._move_speeds) >= 10:
+            max_speed = max(self._move_speeds)
+            # Game-specific: inject MAX_LEGITIMATE_SPEED via SDK config
+            max_legit = self._config.get("max_speed", 800.0)
+            if max_speed > max_legit * 1.05:
+                scores.append(min(1.0, (max_speed - max_legit) / max_legit))
+
+        return max(scores) if scores else 0.0
+```
+
+---
+
+## 4. NORMALIZED EVENT SCHEMA
+
+All games emit events in this universal schema. This is the contract between SDK and server.
+Never break backwards compatibility — add fields, never remove or rename.
+
+```python
+# models/features/schema.py
+from __future__ import annotations
+from enum import StrEnum
+from typing import Any
+from pydantic import BaseModel, Field
+import time
+
+class EventType(StrEnum):
+    SHOT_FIRED       = "shot_fired"
+    HIT_REGISTERED   = "hit_registered"
+    PLAYER_MOVED     = "player_moved"
+    INPUT_FRAME      = "input_frame"
+    SESSION_SUMMARY  = "session_summary"   # TIER 1 batch
+    ANOMALY_BURST    = "anomaly_burst"     # TIER 2 trigger
+
+class PlayerEvent(BaseModel):
+    event_id:        str        # UUID4
+    game_id:         str        # e.g. "my-shooter-v1"
+    server_id:       str        # game server instance ID
+    player_id:       str        # hashed/anonymized player ID
+    session_id:      str        # current match session UUID
+    timestamp_ms:    int        # unix epoch milliseconds
+    event_type:      EventType
+    payload:         dict[str, Any]
+    client_checksum: str        # SHA256(event_id + timestamp_ms + payload_json)
+    sdk_version:     str        # e.g. "1.4.2"
+    local_risk:      float = 0.0  # SDK-computed local risk score [0.0, 1.0]
+
+class SessionSummary(BaseModel):
+    """TIER 1 batch — sent every 5 minutes for clean sessions"""
+    game_id:         str
+    player_id:       str
+    session_id:      str
+    window_start_ms: int
+    window_end_ms:   int
+    sdk_version:     str
+    features:        SummaryFeatures
+
+class SummaryFeatures(BaseModel):
+    """32 pre-computed floats — all that's needed for population-level monitoring"""
+    # Aim
+    headshot_rate:           float
+    avg_reaction_time_ms:    float
+    snap_velocity_p95:       float        # 95th percentile angular snap velocity
+    aim_jitter_variance:     float
+    pre_shot_correction_avg: float
+    recoil_entropy:          float
+    # Timing
+    trigger_interval_cv:     float        # coefficient of variation
+    burst_autocorr:          float
+    shots_fired:             int
+    hits_registered:         int
+    # Movement
+    avg_speed:               float
+    max_speed:               float
+    movement_entropy:        float
+    strafe_period_detected:  float        # 0.0 = no periodic strafe detected
+    path_curvature_var:      float
+    # Session context
+    kills:                   int
+    deaths:                  int
+    assists:                 int
+    playtime_seconds:        int
+    map_id:                  str
+    game_mode:               str
+
+# Payload schemas by event_type
+SHOT_FIRED_SCHEMA = {
+    "weapon_id": str,
+    "aim_vector": list,        # [x, y, z] normalized
+    "crosshair_pos": list,     # [x, y] screen normalized 0-1
+    "trigger_interval_ms": int,
+    "recoil_compensated": bool,
+}
+
+HIT_REGISTERED_SCHEMA = {
+    "target_player_id": str,
+    "hit_zone": str,           # "head" | "body" | "limb"
+    "distance_m": float,
+    "relative_velocity": float,
+    "server_validated": bool,  # server-side hit confirmation
+}
+
+PLAYER_MOVED_SCHEMA = {
+    "position": list,          # [x, y, z]
+    "velocity": list,          # [x, y, z]
+    "speed": float,            # magnitude of velocity
+    "on_ground": bool,
+    "delta_ms": int,
+}
+
+INPUT_FRAME_SCHEMA = {
+    "mouse_delta": list,       # [dx, dy] raw device units
+    "keys_held": list,         # list of key codes
+    "frame_ms": int,
+    "raw_input": bool,
+}
+```
+
+---
+
+## 5. FEATURE ENGINEERING — UNIVERSAL BEHAVIORAL FEATURES
+
+These are computed server-side from raw events. They are game-agnostic by design.
+All feature computation lives in `models/features/compute.py` — never duplicate this code.
+
+```python
+# models/features/compute.py
+import numpy as np
+from scipy.stats import entropy
+from typing import Sequence
+from .schema import PlayerEvent, SummaryFeatures
+
+def compute_aim_features(events: Sequence[PlayerEvent]) -> dict:
+    shots = [e for e in events if e.event_type == "shot_fired"]
+    hits  = [e for e in events if e.event_type == "hit_registered"]
+    frames = [e for e in events if e.event_type == "input_frame"]
+
+    features = {}
+
+    # --- Trigger interval coefficient of variation ---
+    if len(shots) >= 10:
+        intervals = np.diff([s.timestamp_ms for s in shots])
+        cv = intervals.std() / intervals.mean() if intervals.mean() > 0 else 0
+        features["trigger_interval_cv"] = float(cv)
+        # Human range: 0.15–0.5 | Trigger bot: < 0.03
+
+    # --- Pre-shot micro-correction ---
+    # Measures aim vector change in last 80ms before shot. Aimbots don't correct.
+    if shots and frames:
+        corrections = []
+        for shot in shots:
+            recent = [f for f in frames
+                      if shot.timestamp_ms - 80 <= f.timestamp_ms < shot.timestamp_ms]
+            if recent:
+                deltas = [f.payload.get("mouse_delta", [0,0]) for f in recent]
+                mag = np.sqrt(np.array(deltas)**2).sum(axis=1).mean()
+                corrections.append(float(mag))
+        if corrections:
+            features["pre_shot_micro_correction"] = float(np.mean(corrections))
+
+    # --- Snap angular velocity (p95) ---
+    if frames:
+        deltas = np.array([f.payload.get("mouse_delta", [0,0]) for f in frames])
+        dt = np.array([f.payload.get("frame_ms", 16) for f in frames])
+        velocities = np.linalg.norm(deltas, axis=1) / np.maximum(dt, 1) * 1000
+        features["snap_velocity_p95"] = float(np.percentile(velocities, 95))
+
+    # --- Recoil pattern entropy ---
+    if len(shots) >= 20:
+        recoil_vecs = [s.payload.get("aim_vector", [0,0,0]) for s in shots]
+        compensations = np.diff(recoil_vecs, axis=0)
+        hist, _ = np.histogram(compensations[:,0], bins=20, density=True)
+        features["recoil_entropy"] = float(entropy(hist + 1e-10))
+        # Low entropy = bot (same pattern), high entropy = human
+
+    # --- Headshot rate ---
+    head_hits = sum(1 for h in hits if h.payload.get("hit_zone") == "head")
+    features["headshot_rate"] = head_hits / max(len(hits), 1)
+
+    return features
+
+
+def compute_movement_features(events: Sequence[PlayerEvent]) -> dict:
+    moves = [e for e in events if e.event_type == "player_moved"]
+    features = {}
+
+    if len(moves) < 10:
+        return features
+
+    speeds = np.array([m.payload.get("speed", 0.0) for m in moves])
+    features["avg_speed"]  = float(speeds.mean())
+    features["max_speed"]  = float(speeds.max())
+
+    # --- Movement entropy (teleport hack = zero entropy) ---
+    positions = np.array([m.payload.get("position", [0,0,0]) for m in moves])
+    displacements = np.diff(positions, axis=0)
+    mags = np.linalg.norm(displacements, axis=1)
+    hist, _ = np.histogram(mags, bins=20, density=True)
+    features["movement_entropy"] = float(entropy(hist + 1e-10))
+
+    # --- Strafe period detection (bots strafe with mechanical rhythm) ---
+    vx = np.array([m.payload.get("velocity", [0,0,0])[0] for m in moves])
+    if len(vx) >= 32:
+        fft = np.abs(np.fft.rfft(vx))
+        dominant_freq_idx = np.argmax(fft[1:]) + 1
+        features["strafe_period_detected"] = float(dominant_freq_idx)
+
+    # --- Path curvature variance ---
+    if len(positions) >= 3:
+        v1 = np.diff(positions[:-1], axis=0)
+        v2 = np.diff(positions[1:],  axis=0)
+        norms = np.linalg.norm(v1, axis=1) * np.linalg.norm(v2, axis=1)
+        safe_norms = np.maximum(norms, 1e-10)
+        dots = (v1 * v2).sum(axis=1) / safe_norms
+        curvatures = np.arccos(np.clip(dots, -1, 1))
+        features["path_curvature_var"] = float(curvatures.var())
+
+    return features
+
+
+def compute_timing_features(events: Sequence[PlayerEvent]) -> dict:
+    """Reaction time, burst rhythm, wallhack proxy."""
+    features = {}
+    shots = [e for e in events if e.event_type == "shot_fired"]
+    kills = [e for e in events if e.event_type == "hit_registered"
+             and e.payload.get("hit_zone") == "head"]
+
+    # --- Burst rhythm autocorrelation ---
+    if len(shots) >= 20:
+        ts = np.array([s.timestamp_ms for s in shots], dtype=float)
+        intervals = np.diff(ts)
+        if len(intervals) >= 10:
+            autocorr = np.correlate(intervals, intervals, mode='full')
+            mid = len(autocorr) // 2
+            lag1 = autocorr[mid + 1] / autocorr[mid] if autocorr[mid] != 0 else 0
+            features["burst_autocorr"] = float(lag1)
+            # High autocorr at lag-1 = robot-like repetition
+
+    return features
+
+
+def build_feature_vector(events: Sequence[PlayerEvent],
+                         summary: "SummaryFeatures | None" = None) -> np.ndarray:
+    """
+    Canonical 48-dim feature vector used by ALL models.
+    If summary provided (TIER 1 batch), use its pre-computed values.
+    If raw events provided (TIER 2/3), compute fresh.
+    Train and serve MUST call this same function — no divergence.
+    """
+    if summary:
+        return np.array([
+            summary.headshot_rate,
+            summary.avg_reaction_time_ms,
+            summary.snap_velocity_p95,
+            summary.aim_jitter_variance,
+            summary.pre_shot_correction_avg,
+            summary.recoil_entropy,
+            summary.trigger_interval_cv,
+            summary.burst_autocorr,
+            float(summary.shots_fired),
+            float(summary.hits_registered),
+            summary.avg_speed,
+            summary.max_speed,
+            summary.movement_entropy,
+            summary.strafe_period_detected,
+            summary.path_curvature_var,
+            float(summary.kills),
+            float(summary.deaths),
+            float(summary.playtime_seconds),
+            *([0.0] * 30)   # padding to 48 dims
+        ], dtype=np.float32)
+
+    feats = {}
+    feats.update(compute_aim_features(events))
+    feats.update(compute_movement_features(events))
+    feats.update(compute_timing_features(events))
+
+    FEATURE_ORDER = [
+        "headshot_rate", "snap_velocity_p95", "aim_jitter_variance",
+        "pre_shot_micro_correction", "recoil_entropy", "trigger_interval_cv",
+        "burst_autocorr", "movement_entropy", "avg_speed", "max_speed",
+        "path_curvature_var", "strafe_period_detected",
+    ]
+    return np.array([feats.get(k, 0.0) for k in FEATURE_ORDER]
+                    + [0.0] * (48 - len(FEATURE_ORDER)), dtype=np.float32)
+```
+
+---
+
+## 6. SERVICES — IMPLEMENTATION SPEC
+
+### 6.1 Gateway service (`services/gateway/`)
+
+```python
+# services/gateway/main.py
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
+from fastapi.middleware.gzip import GZipMiddleware
+import asyncio, json, hashlib, time
+from aiokafka import AIOKafkaProducer
+from redis.asyncio import Redis
+from models.features.schema import PlayerEvent, SessionSummary
+from .rate_limiter import RateLimiter
+
+app = FastAPI(title="anticheat-gateway", version="1.0.0")
+app.add_middleware(GZipMiddleware, minimum_size=500)
+
+# Startup: connect to Redpanda + Redis
+@app.on_event("startup")
+async def startup():
+    app.state.producer = AIOKafkaProducer(
+        bootstrap_servers=settings.REDPANDA_BROKERS,
+        compression_type="gzip",
+        linger_ms=5,          # batch micro-bursts for efficiency
+        max_batch_size=65536,
+    )
+    await app.state.producer.start()
+    app.state.redis = Redis.from_url(settings.REDIS_URL, decode_responses=True)
+    app.state.rate_limiter = RateLimiter(app.state.redis)
+
+@app.post("/v1/summary")
+async def ingest_summary(summary: SessionSummary, request: Request):
+    """TIER 1: session summary batch from clean players. ~200 bytes gzipped."""
+    await app.state.rate_limiter.check(summary.player_id, limit=300, window=60)
+    await app.state.producer.send(
+        "session-summaries",
+        key=summary.player_id.encode(),
+        value=summary.model_dump_json().encode(),
+    )
+    return {"status": "ok"}
+
+@app.websocket("/v1/stream/{player_id}")
+async def event_stream(ws: WebSocket, player_id: str):
+    """TIER 2: real-time event stream for suspicious sessions only."""
+    await ws.accept()
+    try:
+        async for raw in ws.iter_bytes():
+            event = PlayerEvent.model_validate_json(raw)
+            # Verify checksum
+            expected = hashlib.sha256(
+                f"{event.event_id}{event.timestamp_ms}"
+                f"{json.dumps(event.payload, sort_keys=True)}".encode()
+            ).hexdigest()
+            if event.client_checksum != expected:
+                await ws.close(code=4003, reason="checksum_mismatch")
+                return
+            await app.state.producer.send(
+                "realtime-events",
+                key=player_id.encode(),
+                value=raw,
+            )
+    except WebSocketDisconnect:
+        pass
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "version": settings.VERSION}
+```
+
+### 6.2 Detector service (`services/detector/`)
+
+```python
+# services/detector/consumer.py
+"""
+Real-time rule engine + Isolation Forest.
+Consumes from 'realtime-events' Kafka topic.
+SLA: process each event in <50ms end-to-end.
+"""
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+import asyncio, joblib, numpy as np
+from models.features.schema import PlayerEvent
+from models.features.compute import build_feature_vector
+from .rules import evaluate_rules
+from .session_cache import SessionCache
+
+RULES = [
+    # (name, condition_fn, score)
+    ("impossible_headshot",  lambda e: (
+        e.event_type == "hit_registered"
+        and e.payload.get("hit_zone") == "head"
+        and e.payload.get("distance_m", 0) > 80
+    ), 0.85),
+    ("speed_hack", lambda e: (
+        e.event_type == "player_moved"
+        and e.payload.get("speed", 0) > settings.MAX_SPEED * 1.08
+    ), 0.90),
+    ("trigger_interval_bot", lambda e: (
+        e.event_type == "shot_fired"
+        and e.payload.get("trigger_interval_ms", 999) < 8
+    ), 0.95),
+    ("wallhack_proxy", lambda e: (
+        e.event_type == "hit_registered"
+        and not e.payload.get("server_validated", True)
+    ), 0.80),
+]
+
+async def run():
+    consumer = AIOKafkaConsumer(
+        "realtime-events",
+        bootstrap_servers=settings.REDPANDA_BROKERS,
+        group_id="detector-group",
+        auto_offset_reset="latest",
+    )
+    producer = AIOKafkaProducer(bootstrap_servers=settings.REDPANDA_BROKERS)
+    iso_forest = joblib.load(settings.ISO_FOREST_PATH)
+    session_cache = SessionCache(redis_url=settings.REDIS_URL)
+
+    await asyncio.gather(consumer.start(), producer.start())
+
+    async for msg in consumer:
+        event = PlayerEvent.model_validate_json(msg.value)
+        t0 = asyncio.get_event_loop().time()
+
+        # 1. Rule check — instant
+        rule_score = 0.0
+        triggered_rule = None
+        for name, condition, score in RULES:
+            if condition(event):
+                rule_score = max(rule_score, score)
+                triggered_rule = name
+
+        # 2. Isolation Forest on rolling window
+        window = await session_cache.get_window(event.session_id, event)
+        if len(window) >= 10:
+            fvec = build_feature_vector(window).reshape(1, -1)
+            if_score = float(-iso_forest.score_samples(fvec)[0])  # higher = more anomalous
+        else:
+            if_score = 0.0
+
+        combined = max(rule_score, if_score * 0.7 + event.local_risk * 0.3)
+
+        # 3. Route decision
+        result = {
+            "player_id": event.player_id,
+            "session_id": event.session_id,
+            "game_id":    event.game_id,
+            "score":      combined,
+            "rule":       triggered_rule,
+            "if_score":   if_score,
+            "latency_ms": (asyncio.get_event_loop().time() - t0) * 1000,
+        }
+
+        if combined >= 0.5:
+            await producer.send("detection-results", value=str(result).encode())
+
+        # Alert if SLA breached
+        if result["latency_ms"] > 50:
+            await producer.send("sla-breaches", value=str(result).encode())
+```
+
+### 6.3 ML Worker (`services/ml_worker/`)
+
+```python
+# services/ml_worker/consumer.py
+"""
+Async XGBoost + LSTM inference.
+Consumes 'session-summaries' (TIER 1) and 'detection-results' (TIER 2 escalations).
+No SLA constraint — quality over speed.
+"""
+import asyncio, torch, xgboost as xgb, numpy as np
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from models.features.schema import SessionSummary
+from models.features.compute import build_feature_vector
+from .lstm_model import SessionLSTM
+from .model_loader import ModelLoader
+
+async def run():
+    loader = ModelLoader(mlflow_uri=settings.MLFLOW_URI)
+    xgb_model: xgb.XGBClassifier = await loader.load("xgboost_cheat_v2")
+    lstm_model: SessionLSTM       = await loader.load("lstm_session_v1")
+
+    consumer = AIOKafkaConsumer(
+        "session-summaries", "detection-results",
+        bootstrap_servers=settings.REDPANDA_BROKERS,
+        group_id="ml-worker-group",
+    )
+    producer = AIOKafkaProducer(bootstrap_servers=settings.REDPANDA_BROKERS)
+    await asyncio.gather(consumer.start(), producer.start())
+
+    async for msg in consumer:
+        if msg.topic == "session-summaries":
+            summary = SessionSummary.model_validate_json(msg.value)
+            fvec = build_feature_vector([], summary=summary.features).reshape(1, -1)
+        else:
+            # Escalation from detector — fetch cached events
+            data = eval(msg.value.decode())
+            fvec = np.zeros((1, 48), dtype=np.float32)  # placeholder
+
+        xgb_prob  = float(xgb_model.predict_proba(fvec)[0][1])
+        lstm_prob  = float(torch.sigmoid(lstm_model(
+            torch.tensor(fvec).unsqueeze(0)
+        )).item())
+
+        ensemble = (xgb_prob * 0.6) + (lstm_prob * 0.4)
+
+        await producer.send("ml-scores", value=str({
+            "player_id": data.get("player_id", summary.player_id if msg.topic == "session-summaries" else ""),
+            "xgb_score":  xgb_prob,
+            "lstm_score": lstm_prob,
+            "ensemble":   ensemble,
+        }).encode())
+```
+
+### 6.4 Decision Engine (`services/decision/`)
+
+```python
+# services/decision/consumer.py
+"""
+Combines detector scores + ML scores → final verdict.
+Routes to action queue or human review queue.
+"""
+THRESHOLDS = {
+    "auto_shadow_ban":  0.95,   # immediate action, queue for human confirmation
+    "auto_flag":        0.80,   # restrict matchmaking, add to review
+    "escalate_ml":      0.50,   # send to ml_worker for deep analysis
+    "monitor":          0.30,   # increase sampling rate
+    "clear":            0.15,   # log as clean negative training example
+}
+
+# False positive mitigations
+FP_MITIGATIONS = [
+    # If player has >200 hours clean history, require higher confidence
+    lambda ctx: ctx["score"] * 0.7 if ctx.get("clean_hours", 0) > 200 else ctx["score"],
+    # If detector and ML disagree by >0.35, route to human review
+    lambda ctx: 0.79 if abs(ctx.get("detector_score", 0)
+                           - ctx.get("ml_score", 0)) > 0.35 else ctx["score"],
+    # Never auto-ban on first session — must have history
+    lambda ctx: min(ctx["score"], 0.79) if ctx.get("session_count", 0) < 3 else ctx["score"],
+]
+
+async def make_decision(ctx: dict) -> dict:
+    score = ctx["score"]
+    for mitigation in FP_MITIGATIONS:
+        score = mitigation({**ctx, "score": score})
+
+    if score >= THRESHOLDS["auto_shadow_ban"]:
+        action = "shadow_ban"
+        queue  = "action-queue"
+    elif score >= THRESHOLDS["auto_flag"]:
+        action = "flag"
+        queue  = "action-queue"
+    elif score >= THRESHOLDS["escalate_ml"]:
+        action = "review"
+        queue  = "review-queue"
+    elif score >= THRESHOLDS["monitor"]:
+        action = "monitor"
+        queue  = "monitoring-queue"
+    else:
+        action = "clear"
+        queue  = "training-negatives"
+
+    return {"action": action, "queue": queue, "final_score": score, **ctx}
+```
+
+---
+
+## 7. TRAINING PIPELINE
+
+### Synthetic data generation (for initial model bootstrap)
+```python
+# models/training/generate_synthetic.py
+"""
+Generates labeled training data without real player data.
+Run: python -m models.training.generate_synthetic --n-clean 50000 --n-cheat 5000
+"""
+import numpy as np, pandas as pd
+
+RNG = np.random.default_rng(42)
+
+def generate_clean_player(n: int = 100) -> pd.DataFrame:
+    return pd.DataFrame({
+        "trigger_interval_cv":      RNG.normal(0.25, 0.08, n).clip(0.05, 0.8),
+        "snap_velocity_p95":        RNG.normal(400, 150, n).clip(50, 1200),
+        "headshot_rate":            RNG.beta(2, 6, n),           # ~0.25 avg
+        "movement_entropy":         RNG.normal(2.8, 0.4, n).clip(1.0, 4.0),
+        "recoil_entropy":           RNG.normal(2.5, 0.5, n).clip(0.5, 4.0),
+        "pre_shot_micro_correction":RNG.normal(12.0, 5.0, n).clip(0, 50),
+        "burst_autocorr":           RNG.normal(0.15, 0.1, n).clip(-0.3, 0.5),
+        "label": 0,
+    })
+
+def generate_aimbot(n: int = 100) -> pd.DataFrame:
+    return pd.DataFrame({
+        "trigger_interval_cv":      RNG.normal(0.01, 0.005, n).clip(0, 0.05),
+        "snap_velocity_p95":        RNG.normal(4500, 500, n).clip(2000, 8000),
+        "headshot_rate":            RNG.normal(0.85, 0.05, n).clip(0.6, 1.0),
+        "movement_entropy":         RNG.normal(2.9, 0.3, n).clip(1.5, 4.0),
+        "recoil_entropy":           RNG.normal(0.3, 0.1, n).clip(0, 0.8),
+        "pre_shot_micro_correction":RNG.normal(0.5, 0.3, n).clip(0, 5),
+        "burst_autocorr":           RNG.normal(0.85, 0.05, n).clip(0.6, 1.0),
+        "label": 1,
+    })
+
+def generate_speedhack(n: int = 100) -> pd.DataFrame:
+    base = generate_clean_player(n)
+    base["max_speed"] = RNG.normal(2200, 200, n)   # ~2.5x normal
+    base["movement_entropy"] = RNG.normal(0.4, 0.1, n)  # too regular
+    base["label"] = 1
+    return base
+
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--n-clean", type=int, default=50000)
+    p.add_argument("--n-cheat", type=int, default=5000)
+    p.add_argument("--output",  default="data/synthetic_v1.parquet")
+    args = p.parse_args()
+
+    df = pd.concat([
+        generate_clean_player(args.n_clean),
+        generate_aimbot(args.n_cheat // 2),
+        generate_speedhack(args.n_cheat // 2),
+    ]).sample(frac=1, random_state=42).reset_index(drop=True)
+
+    df.to_parquet(args.output)
+    print(f"Generated {len(df)} samples → {args.output}")
+    print(f"Cheat rate: {df['label'].mean():.2%}")
+```
+
+### XGBoost training script
+```python
+# models/training/train_xgboost.py
+import xgboost as xgb, pandas as pd, numpy as np, mlflow
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, precision_recall_curve
+
+FEATURES = [
+    "trigger_interval_cv", "snap_velocity_p95", "headshot_rate",
+    "movement_entropy", "recoil_entropy", "pre_shot_micro_correction",
+    "burst_autocorr",
+]
+
+def train(data_path: str, experiment_name: str = "anticheat-xgboost"):
+    df = pd.read_parquet(data_path)
+    X, y = df[FEATURES], df["label"]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=42
+    )
+
+    # Class weight for imbalanced data (typically 5% cheat rate)
+    scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
+
+    params = {
+        "n_estimators":      500,
+        "max_depth":         6,
+        "learning_rate":     0.05,
+        "subsample":         0.8,
+        "colsample_bytree":  0.8,
+        "scale_pos_weight":  scale_pos_weight,
+        "eval_metric":       "auc",
+        "early_stopping_rounds": 30,
+        "device":            "cpu",   # no GPU needed for this data size
+    }
+
+    mlflow.set_experiment(experiment_name)
+    with mlflow.start_run():
+        model = xgb.XGBClassifier(**params)
+        model.fit(X_train, y_train,
+                  eval_set=[(X_test, y_test)],
+                  verbose=50)
+
+        probs = model.predict_proba(X_test)[:, 1]
+        auc = roc_auc_score(y_test, probs)
+
+        # Compute FPR at 0.95 threshold
+        precision, recall, thresholds = precision_recall_curve(y_test, probs)
+        mask = thresholds >= 0.95
+        fpr_at_threshold = 1 - precision[mask][0] if mask.any() else None
+
+        mlflow.log_params(params)
+        mlflow.log_metrics({"auc": auc, "fpr_at_095": fpr_at_threshold or 0})
+        mlflow.xgboost.log_model(model, "xgboost_cheat")
+
+        print(f"AUC: {auc:.4f} | FPR@0.95: {fpr_at_threshold:.4f}")
+        assert auc > 0.85, f"AUC {auc} below minimum threshold 0.85"
+        assert fpr_at_threshold < 0.005, f"FPR {fpr_at_threshold} exceeds 0.5% limit"
+
+if __name__ == "__main__":
+    train("data/synthetic_v1.parquet")
+```
+
+---
+
+## 8. INFRASTRUCTURE
+
+### docker-compose.dev.yml (single command local dev)
+```yaml
+# docker-compose.dev.yml
+# Usage: docker compose -f docker-compose.dev.yml up --build
+# Everything needed to run locally, including mock event emitter
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:v24.1.1
+    command:
+      - redpanda start
+      - --smp 1
+      - --memory 512M
+      - --reserve-memory 0M
+      - --overprovisioned
+      - --node-id 0
+      - --kafka-addr PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:29092,OUTSIDE://localhost:9092
+    ports: ["9092:9092", "29092:29092"]
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health"]
+      interval: 10s
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_DB: anticheat
+      POSTGRES_USER: anticheat
+      POSTGRES_PASSWORD: dev_password_change_in_prod
+    ports: ["5432:5432"]
+    volumes: ["timescale_data:/var/lib/postgresql/data"]
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+
+  gateway:
+    build: ./services/gateway
+    ports: ["8000:8000"]
+    environment:
+      REDPANDA_BROKERS: redpanda:29092
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql+asyncpg://anticheat:dev_password_change_in_prod@timescaledb/anticheat
+    depends_on: [redpanda, redis, timescaledb]
+    volumes: ["./models:/app/models"]
+
+  detector:
+    build: ./services/detector
+    environment:
+      REDPANDA_BROKERS: redpanda:29092
+      REDIS_URL: redis://redis:6379
+      ISO_FOREST_PATH: /app/models/registry/isolation_forest_v1.joblib
+    depends_on: [redpanda, redis]
+    volumes: ["./models:/app/models"]
+
+  ml_worker:
+    build: ./services/ml_worker
+    environment:
+      REDPANDA_BROKERS: redpanda:29092
+      MLFLOW_URI: http://mlflow:5000
+    depends_on: [redpanda]
+    volumes: ["./models:/app/models"]
+
+  decision:
+    build: ./services/decision
+    environment:
+      REDPANDA_BROKERS: redpanda:29092
+      DATABASE_URL: postgresql+asyncpg://anticheat:dev_password_change_in_prod@timescaledb/anticheat
+    depends_on: [redpanda, timescaledb]
+
+  action:
+    build: ./services/action
+    environment:
+      REDPANDA_BROKERS: redpanda:29092
+      DATABASE_URL: postgresql+asyncpg://anticheat:dev_password_change_in_prod@timescaledb/anticheat
+    depends_on: [redpanda, timescaledb]
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.14.3
+    ports: ["5000:5000"]
+    command: mlflow server --host 0.0.0.0 --backend-store-uri sqlite:///mlflow.db
+    volumes: ["mlflow_data:/mlflow"]
+
+  # Mock event emitter for demo/testing
+  event_emitter:
+    build: ./tests/emitter
+    environment:
+      GATEWAY_URL: http://gateway:8000
+      MODE: mixed           # clean + aimbot + speedhack sessions
+      USERS: 1000
+      EVENTS_PER_SEC: 500
+    depends_on: [gateway]
+    profiles: ["demo"]     # only starts with: docker compose --profile demo up
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    ports: ["3001:3000"]
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./dashboard/grafana:/etc/grafana/provisioning
+
+volumes:
+  timescale_data:
+  mlflow_data:
+  grafana_data:
+```
+
+### Hetzner production provisioning (Ansible)
+```yaml
+# infra/hetzner/playbook.yml
+# Run: ansible-playbook -i inventory.yml playbook.yml
+---
+- name: Provision anti-cheat VPS nodes
+  hosts: all
+  become: yes
+  tasks:
+    - name: Install Docker
+      shell: curl -fsSL https://get.docker.com | sh
+
+    - name: Install uv
+      shell: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+    - name: Configure firewall
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+      loop: ["22", "80", "443", "9092"]
+
+    - name: Set up swap (2GB — helps with ML inference spikes)
+      command: fallocate -l 2G /swapfile
+      args:
+        creates: /swapfile
+
+    - name: Deploy compose stack
+      docker_compose:
+        project_src: /opt/anticheat
+        files: [docker-compose.prod.yml]
+        state: present
+```
+
+---
+
+## 9. SDK USAGE (how game studios integrate)
+
+### Python SDK (game server integration)
+```python
+# Example: integrating into any Python game server
+
+from anticheat_sdk import AntiCheatClient, LocalScorer
+
+# Initialize once at server startup
+client = AntiCheatClient(
+    api_key="your_studio_api_key",
+    game_id="my-shooter-v1",
+    gateway_url="https://anticheat.yourdomain.com",
+    max_speed=750.0,       # game-specific max legitimate speed
+)
+
+# Per-player session (create on match join)
+session = client.new_session(player_id=hashed_player_id, server_id=server_id)
+
+# In your game loop — these calls are synchronous, <0.1ms each
+session.on_shot_fired(timestamp_ms=now_ms(), aim_vector=[x,y,z])
+session.on_player_moved(position=[x,y,z], velocity=[vx,vy,vz], speed=spd)
+session.on_hit_registered(target_id=tid, hit_zone="head", distance_m=45.2)
+
+# SDK handles all routing internally:
+# - Computes local risk score
+# - Sends session summary every 5 min (TIER 1)
+# - Upgrades to real-time stream if risk score > 0.3 (TIER 2)
+# - You never touch Kafka, Redis, or the ML pipeline
+
+# On match end
+await session.close()
+```
+
+### Unity C# SDK
+```csharp
+// Place AntiCheatManager.cs on a persistent GameObject
+
+using AntiCheatSDK;
+
+public class AntiCheatManager : MonoBehaviour {
+    private AntiCheatSession session;
+
+    void Start() {
+        var client = new AntiCheatClient(
+            apiKey: "your_studio_api_key",
+            gameId: "my-shooter-v1",
+            gatewayUrl: "https://anticheat.yourdomain.com"
+        );
+        session = client.NewSession(playerId: NetworkManager.LocalClientId.ToString());
+    }
+
+    // Call from your shooting script
+    public void OnShotFired(Vector3 aimVector) {
+        session.OnShotFired(
+            timestampMs: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            aimVector: new float[] { aimVector.x, aimVector.y, aimVector.z }
+        );
+    }
+
+    void OnDestroy() => session.CloseAsync();
+}
+```
+
+---
+
+## 10. VERIFICATION CHECKLIST
+
+Before shipping any version, run these in order. All must pass.
+
+### Step 1 — Synthetic model quality gate
+```bash
+uv run python -m models.training.generate_synthetic \
+  --n-clean 50000 --n-cheat 5000 --output data/synthetic_v1.parquet
+
+uv run python -m models.training.train_xgboost data/synthetic_v1.parquet
+# Expected: AUC > 0.85, FPR@0.95 < 0.5%
+# If fails: check feature computation, not the model params
+```
+
+### Step 2 — Latency SLA
+```bash
+docker compose up -d redpanda redis detector
+uv run python tests/bench_detector.py --events-per-second 10000 --duration 60
+# Expected: p50 < 20ms, p95 < 40ms, p99 < 50ms
+# If fails: profile with py-spy, check Redis roundtrips
+```
+
+### Step 3 — False positive rate
+```bash
+uv run python tests/eval_fp_rate.py \
+  --dataset data/synthetic_v1.parquet \
+  --threshold 0.95
+# Expected: FPR < 0.5%
+# If fails: raise threshold or add player history weighting
+```
+
+### Step 4 — Traffic reduction validation
+```bash
+uv run python tests/validate_sampling.py --users 10000 --cheat-rate 0.05
+# Expected: >90% of events dropped at TIER 1 (never reach server)
+# Expected: >95% traffic reduction vs naive approach
+```
+
+### Step 5 — End-to-end demo
+```bash
+docker compose --profile demo up
+# Wait 30 seconds for all services to stabilize
+uv run python tests/e2e_test.py \
+  --emit-aimbot-session \
+  --emit-clean-sessions 100 \
+  --expect-flag-within 10s \
+  --expect-clean-rate 0.99
+# Expected: aimbot session flagged in <10s, >99% clean sessions untouched
+```
+
+### Step 6 — Cost simulation
+```bash
+uv run python tests/cost_simulation.py --mau 1000000 --cheat-rate 0.05
+# Expected output:
+#   Events/day (naive):    1,000,000,000
+#   Events/day (filtered):    59,000,000
+#   Traffic reduction:            94.1%
+#   Estimated bandwidth cost:   €1.77/mo
+#   Recommended VPS config:     3x CX22 + 1x CX42 = €26/mo
+```
+
+---
+
+## 11. BUSINESS MODEL — HOW TO CHARGE STUDIOS
+
+Your cost is nearly flat regardless of user count. Charge studios, not users.
+
+```
+INDIE tier     $500/mo   up to 500k MAU     1 game title
+STUDIO tier  $1,500/mo   up to 2M MAU       up to 3 titles
+PRO tier     $5,000/mo   up to 10M MAU      unlimited titles
+ENTERPRISE  custom/mo    10M+ MAU           SLA + dedicated nodes
+```
+
+At 10 studio clients on PRO tier: $50,000 MRR vs ~$400 infra cost = 99% gross margin.
+This is why the cost model is the product — make it work first.
+
+---
+
+## 12. AGENT RULES — FOLLOW THESE EXACTLY
+
+1. Always run `uv sync` before installing any package. Never use pip directly.
+2. All Pydantic models use v2 syntax (`model_validate`, `model_dump`, not `parse_obj`/`dict()`).
+3. All database queries are async (asyncpg / SQLAlchemy 2.0 async). No sync DB calls.
+4. Feature computation ALWAYS goes through `models/features/compute.py`. Never reimplement.
+5. Every service exposes `/health` returning `{"status": "ok", "version": str, "model_version": str}`.
+6. Every detection decision is logged with: player_id, feature_hash, all model scores, final decision, threshold used, latency_ms.
+7. Thresholds NEVER hardcoded in service code — always read from environment variables with defaults.
+8. New cheat pattern = add rule to detector FIRST (deploy in minutes), then add training data, then retrain.
+9. When in doubt about a detection, route to human review. Never auto-ban on a single signal.
+10. TimescaleDB uses hypertables for all event storage — run `SELECT create_hypertable(...)` in migrations.
+11. Redis keys expire — set TTL on all session caches (default: 2 hours after last event).
+12. SDK version is a mandatory field on every event — enables gradual rollouts and A/B testing of detection logic.

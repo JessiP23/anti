@@ -1,0 +1,12 @@
+[project]
+name = "anticheat-ml-worker"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115.12",
+  "numpy>=2.2.4",
+  "pydantic>=2.11.2",
+  "pydantic-settings>=2.8.1",
+  "uvicorn>=0.34.0",
+  "xgboost>=2.1.4",
+]
